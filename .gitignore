@@ -1,0 +1,11 @@
+# Personal: what the timer saw on your Mac, and its logs.
+state.json
+state.tmp
+reaper.log
+launchd.log
+.lock
+config.json
+__pycache__/
+*.pyc
+.DS_Store
+*.bak*

@@ -1,0 +1,6 @@
+{
+ "enabled": true,
+ "idle_minutes": 10,
+ "limit_minutes": 30,
+ "dry_run": false
+}
