@@ -249,10 +249,10 @@ The timer cleans up by itself. To stop Claude from cleaning up on its own (shutt
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests -v     # 78 tests, nothing real is looked at or touched
+python3 -m unittest discover -s tests -v     # 105 tests, nothing real is looked at or touched
 ```
 
-The tests load a fresh copy of `idle-reaper.py` with its data folder, the transcripts folder and the simulator folder in a temporary directory, and replace `ps`, `lsof`, `lsappinfo`, `launchctl`, `simctl` and `kill` with fakes that only record what they were asked. They cover both deadline rules, who started what, the hooks, the timer turning things off (and leaving yours, busy ones and kept ones on), the commands, and the installer, which runs against a throwaway home folder with `--no-launchd`. A hygiene check keeps em dashes, home-folder paths and signing identities out of the repository. The [GitHub Actions workflow](.github/workflows/tests.yml) runs the suite on macOS on every push.
+The tests load a fresh copy of `idle-reaper.py` with its data folder, the transcripts folder and the simulator folder in a temporary directory, and replace `ps`, `lsof`, `lsappinfo`, `launchctl`, `simctl` and `kill` with fakes that only record what they were asked. They cover both deadline rules, who started what, the hooks, the timer turning things off (and leaving yours, busy ones and kept ones on), what must never be stopped (a Claude session, Claude's own plumbing, a process that reused an old number), the commands, and the installer, which runs against a throwaway home folder with `--no-launchd`. A hygiene check keeps em dashes, home-folder paths and signing identities out of the repository. The [GitHub Actions workflow](.github/workflows/tests.yml) runs the suite on macOS on every push.
 
 ## Uninstall
 

@@ -60,9 +60,12 @@ class FakeSubprocess:
 
     def __init__(self, loaded=False):
         self.calls, self.loaded = [], loaded
+        self.shutdown = (0, "")  # what `simctl shutdown` answers: (exit code, stderr)
 
     def run(self, args, **kwargs):
         self.calls.append(list(args))
+        if list(args[:3]) == ["/usr/bin/xcrun", "simctl", "shutdown"]:
+            return types.SimpleNamespace(returncode=self.shutdown[0], stdout="", stderr=self.shutdown[1])
         code = 0 if (args[0] != "/bin/launchctl" or self.loaded) else 113
         return types.SimpleNamespace(returncode=code, stdout="", stderr="")
 
@@ -173,6 +176,31 @@ class Base(unittest.TestCase):
         with mock.patch.object(self.m.sys, "stdin", io.StringIO(raw)):
             self.m.main(["hook"])
 
+    # A server ------------------------------------------------------------------
+
+    def server_world(self, started=3600, marked=True, cpu="0:05.00"):
+        """A Claude session (pid 400) with a dev server (pid 500) listening on port 3000."""
+        self.proc(400, 1, "claude", self.now - 7200)
+        self.proc(500, 400, "node server.js", self.now - started, cpu=cpu)
+        self.fake.answer(["/usr/sbin/lsof", "-nP", "-iTCP"], "p500\nn*:3000\nTST=LISTEN\n")
+        env = " CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=s1 CLAUDE_PID=400" if marked else ""
+        self.fake.answer(["/bin/ps", "eww"], lambda args: "  500 node server.js HOME=/h PATH=/p%s\n" % env)
+
+    def server_entry(self, **fields):
+        start = self.now - 3600
+        entry = {"pid": 500, "start": start, "ports": [3000], "cmd": "node server.js", "cwd": "/code/app",
+                 "session": "s1", "claude_pid": 400, "first_seen": self.now - 3600, "last_connected": 0,
+                 "last_busy": 0, "cpu": [[self.now - 300, 5.0]], "keep_until": 0, "exempt": None}
+        entry.update(fields)
+        return "500:%d" % start, entry
+
+    def idle_server(self, **fields):
+        """The server above, on the books and long idle: the next tick stops it unless a rule says no."""
+        self.server_world()
+        key, entry = self.server_entry(**fields)
+        self.state(servers={key: entry}, sessions={"s1": {"seen": self.now - 3600}})
+        return key, entry
+
 
 class Helpers(Base):
     def test_cpu_seconds_reads_ps_time(self):
@@ -212,6 +240,14 @@ class Helpers(Base):
         self.m.DATA.mkdir(parents=True)
         self.m.STATE.write_text("garbage")
         self.assertEqual(self.m.load_state(), self.m.empty_state())
+
+    def test_only_one_writer_holds_the_state_at_a_time(self):
+        with self.m.Lock():
+            with self.assertRaises(TimeoutError):
+                with self.m.Lock(wait=0.2):
+                    pass
+        with self.m.Lock(wait=0.2):
+            pass  # free again once the first one lets go
 
 
 class SimulatorRules(Base):
@@ -302,6 +338,18 @@ class Attribution(Base):
         state = self.m.empty_state()
         state["crumbs"] = [self.crumb("xcodebuild test", 1000, end=1200, booted={UDID_A: 500})]
         self.assertEqual(self.m.attribute(state, UDID_A, "iPhone 17 Pro", 500), (None, None))
+
+    def test_a_simulator_that_came_on_just_before_the_command_is_not_its(self):
+        # It booted at 998, inside the window the command covers (which opens five seconds early, at
+        # 995), so only the list of what was already on keeps the command from being given it.
+        state = self.m.empty_state()
+        state["crumbs"] = [self.crumb("xcodebuild test", 1000, end=1200, booted={UDID_A: 998})]
+        self.assertEqual(self.m.attribute(state, UDID_A, "iPhone 17 Pro", 998), (None, None))
+
+    def test_a_simulator_shut_down_and_booted_again_by_the_command_is_its(self):
+        state = self.m.empty_state()
+        state["crumbs"] = [self.crumb("xcodebuild test", 1000, end=1200, booted={UDID_A: 500})]
+        self.assertEqual(self.m.attribute(state, UDID_A, "iPhone 17 Pro", 1100)[0], "s1")
 
     def test_a_boot_long_after_a_finished_command_is_not_its(self):
         state = self.m.empty_state()
@@ -510,23 +558,96 @@ class Timer(Base):
         self.assertEqual(self.shutdowns(), [])
         self.assertIn("every timer starts over", self.m.LOG.read_text())
 
-    # Servers -------------------------------------------------------------------
+    def test_leaves_a_simulator_on_while_xcodebuild_names_it(self):
+        self.state(sims={UDID_A: self.claude_sim(UDID_A, "iPhone 17 Pro", 3600, 1200)})
+        self.proc(600, 1, "xcodebuild build -scheme App -destination id=%s" % UDID_A, self.now - 30)
+        self.m.main(["tick"])
+        self.assertEqual(self.shutdowns(), [])
+        self.assertEqual(self.saved()["sims"][UDID_A]["doing"], "xcodebuild is using it")
 
-    def server_world(self, started=3600, marked=True, cpu="0:05.00"):
-        """A Claude session (pid 400) with a dev server (pid 500) listening on port 3000."""
+    def test_leaves_a_simulator_on_while_an_xcodebuild_test_names_none(self):
+        self.state(sims={UDID_A: self.claude_sim(UDID_A, "iPhone 17 Pro", 3600, 1200)})
+        self.proc(600, 1, "xcodebuild test -scheme App", self.now - 30)
+        self.m.main(["tick"])
+        self.assertEqual(self.shutdowns(), [])
+        self.assertEqual(self.saved()["sims"][UDID_A]["doing"], "xcodebuild is running")
+
+    def test_an_xcodebuild_for_the_mac_or_another_simulator_does_not_hold_it(self):
+        self.state(sims={UDID_A: self.claude_sim(UDID_A, "iPhone 17 Pro", 3600, 1200)})
+        self.proc(600, 1, "xcodebuild test -scheme Mac -destination platform=macOS", self.now - 30)
+        self.proc(601, 1, "xcodebuild test -scheme App -destination id=%s" % UDID_B, self.now - 30)
+        self.m.main(["tick"])
+        self.assertEqual(self.shutdowns(), [["/usr/bin/xcrun", "simctl", "shutdown", UDID_A]])
+
+    def test_a_simulator_that_would_not_shut_down_stays_on_the_books(self):
+        self.state(sims={UDID_A: self.claude_sim(UDID_A, "iPhone 17 Pro", 3600, 1200)})
+        self.sub.shutdown = (1, "An error was encountered processing the command")
+        self.m.main(["tick"])
+        state = self.saved()
+        self.assertIn(UDID_A, state["sims"])
+        self.assertEqual(state["history"], [])
+        self.assertIn("could NOT turn off iPhone 17 Pro", self.m.LOG.read_text())
+
+    def test_a_simulator_that_was_already_off_counts_as_turned_off(self):
+        self.state(sims={UDID_A: self.claude_sim(UDID_A, "iPhone 17 Pro", 3600, 1200)})
+        self.sub.shutdown = (149, "Unable to shutdown device in current state: Shutdown")
+        self.m.main(["tick"])
+        self.assertNotIn(UDID_A, self.saved()["sims"])
+
+    def test_a_simulator_that_just_came_on_is_not_judged_yet(self):
+        self.boot(UDID_A, "iPhone 17 Pro", 60)
+        self.state()
+        self.m.main(["tick"])
+        state = self.saved()
+        self.assertNotIn(UDID_A, state["left_alone"])  # the script that booted it may name it yet
+        self.assertNotIn(UDID_A, state["sims"])
+
+    def test_a_simulator_of_yours_that_claude_boots_afresh_is_judged_again(self):
+        boot = self.boot(UDID_A, "iPhone 17 Pro", 600)
+        crumb = {"id": "", "t": boot - 5, "end": boot + 10, "bg": False, "session": "s1", "booted": {},
+                 "cmd": "xcrun simctl boot %s" % UDID_A}
+        self.state(left_alone={UDID_A: self.now - 9000}, crumbs=[crumb])  # yours, the last time it was on
+        self.m.main(["tick"])
+        state = self.saved()
+        self.assertNotIn(UDID_A, state["left_alone"])
+        self.assertEqual(state["sims"][UDID_A]["sessions"], ["s1"])
+
+    # Simulators a chat's own script booted -------------------------------------
+
+    def script_world(self, booted_ago, command_ago, tool="xcrun simctl bootstatus %s -b" % UDID_A):
+        """A chat's Bash call (pid 700) running a script, whose tool (pid 701) names a simulator.
+        The hook left no crumb: the command the chat typed (`./check.sh`) names no simulator tool."""
+        self.boot(UDID_A, "iPhone 17 Pro", booted_ago)
         self.proc(400, 1, "claude", self.now - 7200)
-        self.proc(500, 400, "node server.js", self.now - started, cpu=cpu)
-        self.fake.answer(["/usr/sbin/lsof", "-nP", "-iTCP"], "p500\nn*:3000\nTST=LISTEN\n")
-        env = " CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=s1 CLAUDE_PID=400" if marked else ""
-        self.fake.answer(["/bin/ps", "eww"], lambda args: "  500 node server.js HOME=/h PATH=/p%s\n" % env)
+        shell = "/bin/zsh -c source ~/.claude/shell-snapshots/snap.sh && ./check.sh"
+        self.proc(700, 400, shell, self.now - command_ago)
+        self.proc(701, 700, tool, self.now - command_ago + 5)
+        mark = " HOME=/h PATH=/p CLAUDECODE=1 CLAUDE_CODE_SESSION_ID=s9 CLAUDE_PID=400"
+        self.fake.answer(["/bin/ps", "eww"], "  700 %s%s\n  701 %s%s\n" % (shell, mark, tool, mark))
+        self.state()
+        self.m.main(["tick"])
+        return self.saved()
 
-    def server_entry(self, **fields):
-        start = self.now - 3600
-        entry = {"pid": 500, "start": start, "ports": [3000], "cmd": "node server.js", "cwd": "/code/app",
-                 "session": "s1", "claude_pid": 400, "first_seen": self.now - 3600, "last_connected": 0,
-                 "last_busy": 0, "cpu": [[self.now - 300, 5.0]], "keep_until": 0, "exempt": None}
-        entry.update(fields)
-        return "500:%d" % start, entry
+    def test_a_simulator_booted_by_a_script_the_chat_ran_is_claudes(self):
+        state = self.script_world(booted_ago=60, command_ago=120)
+        sim = state["sims"][UDID_A]
+        self.assertEqual((sim["why"], sim["sessions"]), ("a script a Claude command ran booted it", ["s9"]))
+        self.assertEqual(self.shutdowns(), [])
+
+    def test_a_simulator_you_booted_that_a_chat_reaches_for_later_stays_yours(self):
+        state = self.script_world(booted_ago=600, command_ago=120)
+        self.assertNotIn(UDID_A, state["sims"])
+        self.assertIn(UDID_A, state["left_alone"])
+
+    def test_a_script_naming_the_same_model_on_another_ios_does_not_mean_this_one(self):
+        named = "xcodebuild test -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=%s'"
+        self.assertNotIn(UDID_A, self.script_world(60, 120, tool=named % "26.0")["sims"])  # this one runs 27.0
+
+    def test_a_script_naming_the_model_and_its_ios_means_this_one(self):
+        named = "xcodebuild test -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=%s'"
+        self.assertEqual(self.script_world(60, 120, tool=named % "27.0")["sims"][UDID_A]["sessions"], ["s9"])
+
+    # Servers -------------------------------------------------------------------
 
     def test_never_touches_a_server_the_user_started(self):
         self.server_world(marked=False)
@@ -577,6 +698,98 @@ class Timer(Base):
         self.m.main(["tick"])
         self.assertEqual(self.kills, [])
 
+    def test_a_kept_server_stays_on(self):
+        self.idle_server(keep_until=self.now + 3600)
+        self.m.main(["tick"])
+        self.assertEqual(self.kills, [])
+
+    def test_a_server_restarted_unasked_is_left_on(self):
+        self.idle_server(exempt={"why": "left on until you next write there", "until_prompt": True})
+        self.m.main(["tick"])
+        self.assertEqual(self.kills, [])
+
+    def test_a_day_long_exemption_runs_out(self):
+        self.idle_server(exempt={"why": "stopped twice today already, so left on", "until": self.now - 60})
+        self.m.main(["tick"])
+        self.assertEqual(self.kills, [(500, signal.SIGTERM)])
+
+    def test_a_server_is_not_stopped_before_four_minutes_of_measurements(self):
+        self.idle_server(cpu=[[self.now - 60, 5.0]])  # idle on paper, but too new to know if it is working
+        self.m.main(["tick"])
+        self.assertEqual(self.kills, [])
+
+    def test_a_server_that_renamed_itself_keeps_its_chats_marker(self):
+        # next-server writes its new title over the memory `ps` reads the environment from, so the
+        # listening process shows no marker (and no HOME or PATH); the `node` that started it still does.
+        self.proc(400, 1, "claude", self.now - 7200)
+        self.proc(500, 400, "node node_modules/.bin/next dev", self.now - 3600)
+        self.proc(501, 500, "next-server (v16.1.1)", self.now - 3590)
+        self.fake.answer(["/usr/sbin/lsof", "-nP", "-iTCP"], "p501\nn*:3000\nTST=LISTEN\n")
+        self.fake.answer(["/bin/ps", "eww"], "  500 node node_modules/.bin/next dev HOME=/h PATH=/p CLAUDECODE=1 "
+                                             "CLAUDE_CODE_SESSION_ID=s1 CLAUDE_PID=400\n  501 next-server (v16.1.1)\n")
+        self.state()
+        self.m.main(["tick"])
+        servers = list(self.saved()["servers"].values())
+        self.assertEqual([(s["session"], s["pid"], s["ports"]) for s in servers], [("s1", 500, [3000])])
+
+    # What must never be killed ---------------------------------------------------
+
+    def test_a_server_holding_a_claude_session_is_in_use_and_never_killed(self):
+        key, entry = self.idle_server()
+        self.proc(501, 500, "claude", self.now - 100)  # a Claude session started from inside the task
+        self.m.main(["tick"])
+        self.assertEqual(self.kills, [])
+        self.assertEqual(self.saved()["servers"][key]["doing"], "a Claude session runs inside it")
+        # Asked to directly, the stop itself still refuses.
+        self.assertEqual(self.m.stop_server(entry, 10), (False, "a Claude session runs inside it"))
+        self.assertEqual(self.kills, [])
+
+    def test_a_reused_pid_is_never_killed(self):
+        self.proc(500, 1, "postgres -D /data", self.now - 10)  # someone else's process with the old number
+        _, entry = self.server_entry()
+        self.assertEqual(self.m.stop_server(entry, 10), (True, "already gone"))
+        self.assertEqual(self.kills, [])
+
+    def marked_listener(self, cmd):
+        """A listening process that carries a chat's marker, as everything a Bash call starts does."""
+        self.server_world()
+        self.proc(500, 400, cmd, self.now - 3600)
+        self.state(sessions={"s1": {"seen": self.now - 3600}})
+        self.m.main(["tick"])
+        self.m.main(["tick"])
+        return self.saved()
+
+    def test_an_mcp_server_is_never_treated_as_a_server_to_stop(self):
+        state = self.marked_listener("node /x/mcp-server/index.js")
+        self.assertEqual((state["servers"], self.kills), ({}, []))
+        self.assertEqual(len(state["not_claude"]), 1)
+
+    def test_a_claude_session_that_listens_is_never_treated_as_a_server_to_stop(self):
+        state = self.marked_listener("claude")
+        self.assertEqual((state["servers"], self.kills), ({}, []))
+
+    def test_a_server_that_ignores_the_polite_stop_gets_a_hard_one(self):
+        self.server_world()
+        _, entry = self.server_entry()
+        clock = [float(self.now)]
+
+        def stubborn(pid, sig):  # dies only to SIGKILL
+            if pid in self.dead or pid not in self.rows:
+                raise ProcessLookupError(pid)
+            if sig:
+                self.kills.append((pid, sig))
+            if sig == signal.SIGKILL:
+                self.dead.add(pid)
+
+        def nap(seconds):  # the six seconds it is given pass at once
+            clock[0] += seconds
+
+        with mock.patch.object(self.m.os, "kill", stubborn), \
+                mock.patch.object(self.m.time, "time", lambda: clock[0]), \
+                mock.patch.object(self.m.time, "sleep", nap):
+            self.assertEqual(self.m.stop_server(entry, 10), (True, "needed a hard stop"))
+        self.assertEqual(self.kills, [(500, signal.SIGTERM), (500, signal.SIGKILL)])
+
 
 class Commands(Base):
     def two_sims(self):
@@ -610,6 +823,18 @@ class Commands(Base):
         self.two_sims()
         self.printed(self.m.main, ["off", "Max"])
         self.assertEqual(self.shutdowns(), [["/usr/bin/xcrun", "simctl", "shutdown", UDID_B]])
+
+    def test_keep_and_off_take_a_port(self):
+        key, _ = self.idle_server()
+        self.assertIn("port 3000: kept on for 8 h", self.printed(self.m.main, ["keep", "3000"]))
+        self.assertAlmostEqual(self.saved()["servers"][key]["keep_until"], self.now + 8 * 3600, delta=5)
+        self.m.main(["tick"])
+        self.assertEqual(self.kills, [], "kept, so the timer leaves it")
+        self.assertIn("Turned off port 3000", self.printed(self.m.main, ["off", "3000"]))
+        self.assertEqual(self.kills, [(500, signal.SIGTERM)])
+        state = self.saved()
+        self.assertEqual(state["servers"], {})
+        self.assertEqual(state["tombstones"], [], "one you turned off yourself may be started again freely")
 
     def test_off_with_nothing_on(self):
         self.state()
@@ -685,6 +910,16 @@ class Shim(unittest.TestCase):
         payload = self.send("xcrun simctl boot 'iPhone 17 Pro'")
         with open(self.got) as fh:
             self.assertEqual(fh.read(), "hook|" + payload + "\n")
+
+    def test_passes_every_kind_of_simulator_command_on(self):
+        for command in ("xcodebuild test -scheme App", "open -a Simulator", "npx expo start", "flutter run",
+                        "npx react-native run-ios", "maestro test flow.yaml", "fastlane scan"):
+            with self.subTest(command=command):
+                if os.path.exists(self.got):
+                    os.remove(self.got)
+                payload = self.send(command)
+                with open(self.got) as fh:
+                    self.assertEqual(fh.read(), "hook|" + payload + "\n")
 
     def test_skips_everything_else(self):
         self.send("npm test")

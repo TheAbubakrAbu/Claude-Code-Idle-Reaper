@@ -180,6 +180,19 @@ class Installer(unittest.TestCase):
         self.assertIn("left", done.stderr)
         with open(other) as fh:
             self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
+        self.install("--uninstall")
+        self.assertTrue(os.path.exists(other), "uninstall removes only its own link")
+
+    def test_leaves_a_running_link_to_something_else_alone(self):
+        os.makedirs(self.bin)
+        link, other = os.path.join(self.bin, "running"), os.path.join(self.tmp, "other-tool")
+        open(other, "w").close()
+        os.symlink(other, link)
+        done = self.install()
+        self.assertIn("left %s alone" % link, done.stderr)
+        self.assertEqual(os.readlink(link), other)
+        self.install("--uninstall")
+        self.assertEqual(os.readlink(link), other, "uninstall removes only its own link")
 
     def test_refuses_a_settings_file_that_is_not_an_object(self):
         self.write_settings([1, 2])
